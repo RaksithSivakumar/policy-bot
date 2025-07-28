@@ -12,6 +12,7 @@ langchain-community
 langchain-google-genai
 google-generativeai
 pinecone
+langchain_pinecone
 
 # Document and utility dependencies
 pypdf
