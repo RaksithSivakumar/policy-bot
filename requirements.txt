@@ -1,23 +1,21 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-python-dotenv==1.0.0
-google-generativeai==0.3.2
-pinecone-client==4.1.2
-langchain==0.1.20
-langchain-community==0.0.38
-langchain-google-genai==1.0.10
-langchain-pinecone==0.2.11
-pypdf==3.17.1
-requests==2.31.0
-pydantic==2.5.0
-python-multipart==0.0.6
+# Web framework
+fastapi
+uvicorn[standard]
+python-dotenv
+pydantic
+python-multipart
 
-# Document processing dependencies
-docx2txt==0.8
-python-docx==0.8.11
+# LangChain and AI dependencies
+langchain
+langchain-core
+langchain-community
+langchain-google-genai
+google-generativeai
+pinecone-client
 
-# Email processing
-email-validator==2.1.0
-
-# Optional: For better .msg file support
-# extract-msg==0.28.7  # Uncomment if needed
+# Document and utility dependencies
+pypdf
+requests
+docx2txt
+python-docx
+email-validator
