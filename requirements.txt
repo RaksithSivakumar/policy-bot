@@ -6,7 +6,7 @@ pinecone-client==4.1.2
 langchain==0.1.20
 langchain-community==0.0.38
 langchain-google-genai==1.0.10
-langchain-pinecone==0.1.0
+langchain-pinecone==0.2.11
 pypdf==3.17.1
 requests==2.31.0
 pydantic==2.5.0
