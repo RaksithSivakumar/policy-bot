@@ -20,4 +20,4 @@ python-docx==0.8.11
 email-validator==2.1.0
 
 # Optional: For better .msg file support
-# extract-msg==0.28.7  # Uncomment if you need better .msg support
+# extract-msg==0.28.7  # Uncomment if needed
