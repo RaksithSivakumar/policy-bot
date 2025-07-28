@@ -15,8 +15,6 @@ python-multipart==0.0.6
 # Document processing dependencies
 docx2txt==0.8
 python-docx==0.8.11
-unstructured==0.10.30
-unstructured[local-inference]==0.10.30
 
 # Email processing
 email-validator==2.1.0
