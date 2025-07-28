@@ -1,0 +1,8 @@
+pdf-insights-bot/
+├── main.py               # FastAPI backend
+├── vector_store/         # Stores FAISS index
+├── temp/                 # Temporary PDFs
+├── utils/                # Helper functions
+│   └── gemini_embed.py
+│   └── chunking.py
+├── requirements.txt
