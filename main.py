@@ -41,7 +41,7 @@ if not PINECONE_API_KEY:
 os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
 os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
 
-INDEX_NAME = "index-1"
+INDEX_NAME = "index-3"
 
 # CHANGE 1: Add root_path for URL prefix support
 app = FastAPI(
