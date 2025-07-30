@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: hackrx-rag-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: PINECONE_API_KEY_1
+        sync: false
+      - key: BEARER_TOKEN
+        value: d9e1bb21c5cff7a1f6ca363f518247edc095b46b77b0f67ccf4787591bfaabb7
+    healthCheckPath: /api/v1/health
