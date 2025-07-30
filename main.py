@@ -5,17 +5,19 @@ from typing import List
 from dotenv import load_dotenv
 import google.generativeai as genai
 from pinecone import Pinecone, ServerlessSpec
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_pinecone import PineconeVectorStore
 from langchain.chains import RetrievalQA
-from fastapi import FastAPI, HTTPException, Depends, Security, File, UploadFile
+from langchain.schema import Document
+from fastapi import FastAPI, HTTPException, Depends, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 import uvicorn
 import time
 import logging
+from email.parser import Parser
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -41,15 +43,32 @@ os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
 
 INDEX_NAME = "index-1"
 
-app = FastAPI(title="HackRX RAG API", description="RAG system for document Q&A", version="1.0.0")
+app = FastAPI(title="HackRX RAG API", description="Single endpoint RAG system for PDF, DOCX, and Email documents", version="1.0.0")
 
 # Security
 security = HTTPBearer()
+
+# Supported document types
+SUPPORTED_EXTENSIONS = {'.pdf', '.docx', '.doc', '.eml', '.msg', '.txt'}
 
 # Request/Response models
 class QueryRequest(BaseModel):
     documents: str
     questions: List[str]
+    
+    @validator('documents')
+    def validate_documents(cls, v):
+        if not v.strip():
+            raise ValueError('documents cannot be empty')
+        return v
+    
+    @validator('questions')
+    def validate_questions(cls, v):
+        if not v:
+            raise ValueError('questions list cannot be empty')
+        if len(v) > 20:  # Limit questions per request
+            raise ValueError('maximum 20 questions per request')
+        return v
 
 class QueryResponse(BaseModel):
     answers: List[str]
@@ -86,12 +105,7 @@ def setup_pinecone():
             time.sleep(10)
             logger.info("Index created successfully!")
         else:
-            # Verify dimensions
-            index_info = pc.describe_index(INDEX_NAME)
-            if index_info.dimension != 768:
-                logger.error(f"Index dimension mismatch: {index_info.dimension} != 768")
-                raise ValueError("Index dimension mismatch")
-            logger.info(f"✅ Index {INDEX_NAME} already exists with correct dimension")
+            logger.info(f"✅ Index {INDEX_NAME} already exists")
             
         return pc
         
@@ -99,31 +113,51 @@ def setup_pinecone():
         logger.error(f"Error setting up Pinecone: {str(e)}")
         raise
 
-def process_document_source(source: str) -> str:
-    """Process document source - either URL or local file path"""
-    # Check if it's a local file path
-    if os.path.exists(source) and source.lower().endswith('.pdf'):
-        logger.info(f"Using local PDF file: {source}")
-        return source
+def detect_document_type(file_path: str, content_type: str = None) -> str:
+    """Detect document type from file extension and content type"""
+    # Get file extension
+    _, ext = os.path.splitext(file_path.lower())
     
-    # Check if it's a URL
-    if source.startswith(('http://', 'https://')):
-        logger.info(f"Downloading PDF from URL: {source}")
-        return download_pdf(source)
+    # Check by extension first
+    if ext == '.pdf':
+        return 'pdf'
+    elif ext in ['.docx', '.doc']:
+        return 'docx'
+    elif ext in ['.eml', '.msg']:
+        return 'email'
+    elif ext == '.txt':
+        # Check if it's an email in text format
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read(1000)  # Read first 1000 chars
+                if any(header in content.lower() for header in ['from:', 'to:', 'subject:', 'date:']):
+                    return 'email'
+        except:
+            pass
+        return 'txt'
     
-    # Invalid source
-    raise HTTPException(
-        status_code=400, 
-        detail=f"Invalid document source. Must be a valid URL or local file path to a PDF file."
-    )
-    """Download PDF from URL and return temporary file path"""
+    # Check by content type if extension is unclear
+    if content_type:
+        if 'pdf' in content_type.lower():
+            return 'pdf'
+        elif 'word' in content_type.lower() or 'document' in content_type.lower():
+            return 'docx'
+        elif 'email' in content_type.lower() or 'message' in content_type.lower():
+            return 'email'
+    
+    # Default fallback
+    logger.warning(f"Could not determine document type for {file_path}, defaulting to text")
+    return 'txt'
+
+def download_document(url: str) -> str:
+    """Download document from URL and return temporary file path"""
     try:
-        logger.info(f"Downloading PDF from: {url}")
+        logger.info(f"Downloading document from: {url}")
         
         # Add headers to mimic a browser request
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'application/pdf,*/*',
+            'Accept': 'application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword,message/rfc822,*/*',
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
@@ -134,79 +168,234 @@ def process_document_source(source: str) -> str:
         
         # Check if the response is successful
         if response.status_code == 403:
-            logger.error("403 Forbidden - The PDF URL may have expired or requires different authentication")
+            logger.error("403 Forbidden - The document URL may have expired or requires different authentication")
             raise HTTPException(
                 status_code=403, 
-                detail="PDF URL access denied. The URL may have expired or requires different authentication. Please provide a valid PDF URL."
+                detail="Document URL access denied. The URL may have expired or requires different authentication."
             )
         elif response.status_code == 404:
-            logger.error("404 Not Found - The PDF URL does not exist")
+            logger.error("404 Not Found - The document URL does not exist")
             raise HTTPException(
                 status_code=404, 
-                detail="PDF not found at the provided URL. Please check the URL and try again."
+                detail="Document not found at the provided URL. Please check the URL and try again."
             )
         
         response.raise_for_status()
         
-        # Verify content type
+        # Get content type
         content_type = response.headers.get('content-type', '').lower()
-        if 'pdf' not in content_type and not content_type.startswith('application/'):
-            logger.warning(f"Content type may not be PDF: {content_type}")
+        logger.info(f"Content type: {content_type}")
         
         # Check if we actually got content
         if len(response.content) == 0:
             raise HTTPException(status_code=400, detail="Downloaded file is empty")
         
+        # Determine file extension based on content type
+        file_ext = '.bin'  # default
+        if 'pdf' in content_type:
+            file_ext = '.pdf'
+        elif 'word' in content_type or 'officedocument' in content_type:
+            file_ext = '.docx'
+        elif 'msword' in content_type:
+            file_ext = '.doc'
+        elif 'email' in content_type or 'message' in content_type:
+            file_ext = '.eml'
+        elif 'text' in content_type:
+            file_ext = '.txt'
+        
         # Create temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
             tmp_file.write(response.content)
             tmp_path = tmp_file.name
             
-        logger.info(f"PDF downloaded successfully to: {tmp_path} (Size: {len(response.content)} bytes)")
+        logger.info(f"Document downloaded successfully to: {tmp_path} (Size: {len(response.content)} bytes)")
         return tmp_path
         
     except requests.exceptions.RequestException as e:
-        logger.error(f"Request error downloading PDF: {str(e)}")
+        logger.error(f"Request error downloading document: {str(e)}")
         if "403" in str(e):
             raise HTTPException(
                 status_code=403, 
-                detail="Access denied to PDF URL. The URL may have expired or requires authentication."
+                detail="Access denied to document URL. The URL may have expired or requires authentication."
             )
         elif "404" in str(e):
             raise HTTPException(
                 status_code=404, 
-                detail="PDF not found at the provided URL."
+                detail="Document not found at the provided URL."
             )
         else:
-            raise HTTPException(status_code=400, detail=f"Failed to download PDF: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Failed to download document: {str(e)}")
     except HTTPException:
         raise  # Re-raise HTTP exceptions as-is
     except Exception as e:
-        logger.error(f"Unexpected error downloading PDF: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Unexpected error downloading PDF: {str(e)}")
+        logger.error(f"Unexpected error downloading document: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error downloading document: {str(e)}")
 
-def load_and_process_documents(pdf_path: str, is_temp_file: bool = True):
-    """Load PDF and split into chunks"""
+def parse_email_content(file_path: str) -> List[Document]:
+    """Parse email content and extract meaningful text"""
+    try:
+        documents = []
+        
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        
+        # Try to parse as email
+        if 'From:' in content or 'To:' in content or 'Subject:' in content:
+            # Parse email headers and body
+            parser = Parser()
+            try:
+                msg = parser.parsestr(content)
+                
+                # Extract email metadata
+                subject = msg.get('Subject', 'No Subject')
+                from_addr = msg.get('From', 'Unknown Sender')
+                to_addr = msg.get('To', 'Unknown Recipient')
+                date = msg.get('Date', 'Unknown Date')
+                
+                # Extract body
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == "text/plain":
+                            try:
+                                body += part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                            except:
+                                body += str(part.get_payload())
+                else:
+                    try:
+                        body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+                    except:
+                        body = str(msg.get_payload())
+                
+                # Create structured document
+                email_text = f"""
+                Subject: {subject}
+                From: {from_addr}
+                To: {to_addr}
+                Date: {date}
+                
+                Content:
+                {body}
+                """
+                
+                documents.append(Document(
+                    page_content=email_text.strip(),
+                    metadata={
+                        "source": file_path,
+                        "type": "email",
+                        "subject": subject,
+                        "from": from_addr,
+                        "to": to_addr,
+                        "date": date
+                    }
+                ))
+                
+            except Exception as e:
+                logger.warning(f"Failed to parse as email, treating as plain text: {str(e)}")
+                # Fallback to plain text
+                documents.append(Document(
+                    page_content=content,
+                    metadata={"source": file_path, "type": "text"}
+                ))
+        else:
+            # Treat as plain text
+            documents.append(Document(
+                page_content=content,
+                metadata={"source": file_path, "type": "text"}
+            ))
+        
+        return documents
+        
+    except Exception as e:
+        logger.error(f"Error parsing email content: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error parsing email content: {str(e)}")
+
+def process_document_source(source: str) -> str:
+    """Process document source - either URL or local file path"""
+    # Check if it's a local file path
+    if os.path.exists(source):
+        # Validate file extension
+        _, ext = os.path.splitext(source.lower())
+        if ext not in SUPPORTED_EXTENSIONS:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Unsupported file type: {ext}. Supported types: {', '.join(SUPPORTED_EXTENSIONS)}"
+            )
+        logger.info(f"Using local file: {source}")
+        return source
+    
+    # Check if it's a URL
+    if source.startswith(('http://', 'https://')):
+        logger.info(f"Downloading document from URL: {source}")
+        return download_document(source)
+    
+    # Invalid source
+    raise HTTPException(
+        status_code=400, 
+        detail=f"Invalid document source. Must be a valid URL or local file path to a supported document type: {', '.join(SUPPORTED_EXTENSIONS)}"
+    )
+
+def load_and_process_documents(file_path: str, is_temp_file: bool = True):
+    """Load document based on type and split into chunks"""
     try:
         # Verify file exists
-        if not os.path.exists(pdf_path):
-            raise HTTPException(status_code=404, detail=f"PDF file not found: {pdf_path}")
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail=f"Document file not found: {file_path}")
         
-        # Load document
-        loader = PyPDFLoader(pdf_path)
-        documents = loader.load()
-        logger.info(f"Loaded {len(documents)} pages from PDF")
+        # Detect document type
+        doc_type = detect_document_type(file_path)
+        logger.info(f"Detected document type: {doc_type}")
+        
+        # Load document based on type
+        documents = []
+        
+        if doc_type == 'pdf':
+            loader = PyPDFLoader(file_path)
+            documents = loader.load()
+            logger.info(f"Loaded {len(documents)} pages from PDF")
+            
+        elif doc_type == 'docx':
+            try:
+                loader = Docx2txtLoader(file_path)
+                documents = loader.load()
+                logger.info(f"Loaded DOCX document with {len(documents)} sections")
+            except Exception as e:
+                logger.error(f"Error loading DOCX: {str(e)}")
+                # Fallback: try to read as text
+                try:
+                    with open(file_path, 'rb') as f:
+                        content = f.read().decode('utf-8', errors='ignore')
+                    documents = [Document(page_content=content, metadata={"source": file_path, "type": "docx"})]
+                except Exception as fallback_e:
+                    logger.error(f"Fallback also failed: {str(fallback_e)}")
+                    raise HTTPException(status_code=500, detail=f"Could not process DOCX file: {str(e)}")
+                
+        elif doc_type == 'email':
+            documents = parse_email_content(file_path)
+            logger.info(f"Loaded email document with {len(documents)} sections")
+            
+        else:  # text or unknown
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            documents = [Document(page_content=content, metadata={"source": file_path, "type": "text"})]
+            logger.info("Loaded as plain text document")
+        
+        if not documents:
+            raise HTTPException(status_code=400, detail="No content could be extracted from the document")
         
         # Split into chunks
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=3500,
-            chunk_overlap=300
+            chunk_overlap=300,
+            separators=["\n\n", "\n", ". ", " ", ""]
         )
         docs = text_splitter.split_documents(documents)
         logger.info(f"Split into {len(docs)} chunks")
         
         return docs, is_temp_file
         
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions as-is
     except Exception as e:
         logger.error(f"Error processing documents: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing documents: {str(e)}")
@@ -246,27 +435,29 @@ def setup_qa_system(vectorstore):
     """Setup the QA system with Gemini LLM"""
     try:
         system_prompt = (
-            "You are a helpful assistant answering questions from an insurance policy document. "
-            "Answer each question with a complete and factually accurate sentence, using only the information found in the document. "
-            "Do not include line breaks, bullet points, or extra commentary. "
-            "If the document does not contain the answer, respond with: 'The document does not contain this information.'"
-            "Mention the key exclusions for maternity, childbirth, and follow-up treatment, which are important to clarify the coverage boundaries"
+            "You are a highly accurate and professional assistant answering questions strictly using information from uploaded documents such as PDFs, Word files, or emails. "
+            "Respond to each question with a clear, concise, factually correct, and well-structured full sentence. "
+            "Avoid using bullet points, line breaks, or formatting unless explicitly present in the original document. "
+            "Each answer should be informative and natural, suitable for direct use in policy explanations or customer communication. "
+            "Use formal language with high confidence, and maintain consistency in terminology. "
+            "When answering questions about insurance policies, always include exclusions, conditions, and specific limits when applicable. "
+            "If a question cannot be answered based on the document, respond exactly with: 'The document does not contain this information.' "
+            "Ensure your response style resembles professional policy documentation or FAQ tone with an accuracy range of 75–85%."
         )
-
 
 
         llm = ChatGoogleGenerativeAI(
             model="gemini-2.0-flash",
             google_api_key=GOOGLE_API_KEY,
             temperature=0,
-            system_message=system_prompt,  # ✅ Add this line
+            system_message=system_prompt,
             convert_system_message_to_human=True
         )
 
         qa = RetrievalQA.from_chain_type(
             llm=llm,
             chain_type="stuff",
-            retriever=vectorstore.as_retriever(search_kwargs={"k": 3})
+            retriever=vectorstore.as_retriever(search_kwargs={"k": 5})  # Increased k for better context
         )
 
         return qa
@@ -274,7 +465,6 @@ def setup_qa_system(vectorstore):
     except Exception as e:
         logger.error(f"Error setting up QA system: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error setting up QA system: {str(e)}")
-
 
 def get_or_create_qa_system(doc_source: str):
     """Get existing QA system or create new one for the document"""
@@ -285,7 +475,7 @@ def get_or_create_qa_system(doc_source: str):
         logger.info(f"Reusing existing QA system for document: {doc_hash}")
         return qa_systems[doc_hash]
     
-    pdf_path = None
+    file_path = None
     is_temp_file = False
     
     try:
@@ -293,23 +483,23 @@ def get_or_create_qa_system(doc_source: str):
         pc = setup_pinecone()
         
         # Process document source (URL or local file)
-        pdf_path = process_document_source(doc_source)
+        file_path = process_document_source(doc_source)
         is_temp_file = not os.path.exists(doc_source)  # True if we downloaded it
         
-        # Verify the PDF file
-        if not os.path.exists(pdf_path):
-            raise HTTPException(status_code=500, detail="Failed to access PDF file")
+        # Verify the document file
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=500, detail="Failed to access document file")
         
-        file_size = os.path.getsize(pdf_path)
+        file_size = os.path.getsize(file_path)
         if file_size == 0:
-            raise HTTPException(status_code=400, detail="PDF file is empty")
+            raise HTTPException(status_code=400, detail="Document file is empty")
         
-        logger.info(f"Processing PDF file: {pdf_path} (Size: {file_size} bytes)")
+        logger.info(f"Processing document file: {file_path} (Size: {file_size} bytes)")
         
-        docs, is_temp = load_and_process_documents(pdf_path, is_temp_file)
+        docs, is_temp = load_and_process_documents(file_path, is_temp_file)
         
         if not docs:
-            raise HTTPException(status_code=400, detail="No content could be extracted from the PDF")
+            raise HTTPException(status_code=400, detail="No content could be extracted from the document")
         
         # Store embeddings
         vectorstore = store_embeddings_in_pinecone(docs, doc_hash)
@@ -330,21 +520,29 @@ def get_or_create_qa_system(doc_source: str):
         raise HTTPException(status_code=500, detail=f"Error creating QA system: {str(e)}")
     finally:
         # Clean up temporary file only if it was downloaded
-        if pdf_path and is_temp_file and os.path.exists(pdf_path):
+        if file_path and is_temp_file and os.path.exists(file_path):
             try:
-                os.unlink(pdf_path)
-                logger.info(f"Cleaned up temporary file: {pdf_path}")
+                os.unlink(file_path)
+                logger.info(f"Cleaned up temporary file: {file_path}")
             except Exception as e:
-                logger.warning(f"Failed to clean up temporary file {pdf_path}: {str(e)}")
+                logger.warning(f"Failed to clean up temporary file {file_path}: {str(e)}")
 
 @app.post("/hackrx/run", response_model=QueryResponse)
 async def run_queries(request: QueryRequest, token: str = Depends(verify_token)):
     """
-    Process document and answer questions using RAG
+    Process multi-format documents (PDF, DOCX, Email) and answer questions using RAG
+    
+    Supported formats:
+    - PDF documents (.pdf)
+    - Word documents (.docx, .doc)
+    - Email files (.eml, .msg, or text files with email headers)
+    - Plain text files (.txt)
+    
+    The API automatically detects the document type and processes it accordingly.
     """
     try:
-        logger.info(f"Processing request with {len(request.questions)} questions")
-        logger.info(f"Document URL: {request.documents}")
+        logger.info(f"🚀 Processing request with {len(request.questions)} questions")
+        logger.info(f"Document source: {request.documents[:100]}...")
         
         # Get or create QA system for the document
         qa = get_or_create_qa_system(request.documents)
@@ -359,69 +557,48 @@ async def run_queries(request: QueryRequest, token: str = Depends(verify_token))
                 response = qa.invoke({"query": question})
                 answer = response.get("result", "No answer generated")
 
-                    # Strip newline characters and ensure it's in one line
-                clean_answer = answer.replace('\n', ' ').strip()
+                # Strip newline characters and ensure it's in one line
+                clean_answer = answer.replace('\n', ' ').replace('\r', ' ').strip()
+                
+                # Remove extra spaces
+                clean_answer = ' '.join(clean_answer.split())
 
-                # Prevent duplicates
-                if clean_answer not in answers:
-                    answers.append(clean_answer)
-
+                answers.append(clean_answer)
                 logger.info(f"Answer {i+1} generated successfully")
                 
             except Exception as e:
                 logger.error(f"Error processing question {i+1}: {str(e)}")
-                answers.append(f"Error processing question: {str(e)}")
+                answers.append("Error processing this question.")
         
-        logger.info("All questions processed successfully")
+        logger.info("✅ All questions processed successfully")
         return QueryResponse(answers=answers)
         
     except HTTPException:
         raise  # Re-raise HTTP exceptions as-is
     except Exception as e:
-        logger.error(f"Error in run_queries: {str(e)}")
+        logger.error(f"❌ Error in run_queries: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
-# Test endpoint for debugging
-@app.post("/test/pdf-download")
-async def test_pdf_download(url: str, token: str = Depends(verify_token)):
-    """
-    Test endpoint to check if PDF URL is accessible
-    """
-    try:
-        logger.info(f"Testing PDF download from: {url}")
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/pdf,*/*'
-        }
-        
-        response = requests.head(url, headers=headers, timeout=10, allow_redirects=True)
-        
-        return {
-            "url": url,
-            "status_code": response.status_code,
-            "headers": dict(response.headers),
-            "accessible": response.status_code == 200,
-            "content_type": response.headers.get('content-type', 'unknown'),
-            "content_length": response.headers.get('content-length', 'unknown')
-        }
-        
-    except Exception as e:
-        return {
-            "url": url,
-            "error": str(e),
-            "accessible": False
-        }
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "message": "RAG API is running"}
+    return {
+        "status": "healthy", 
+        "message": "HackRX RAG API is running",
+        "supported_formats": list(SUPPORTED_EXTENSIONS),
+        "endpoint": "/hackrx/run"
+    }
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
-    return {"message": "HackRX RAG API", "version": "1.0.0"}
+    """Root endpoint with API information"""
+    return {
+        "message": "HackRX RAG API - Single Endpoint", 
+        "version": "1.0.0",
+        "main_endpoint": "/hackrx/run",
+        "supported_formats": list(SUPPORTED_EXTENSIONS),
+        "description": "Upload PDF, DOCX, or Email documents and ask questions about them"
+    }
 
 # Startup event
 @app.on_event("startup")
@@ -439,6 +616,9 @@ async def startup_event():
             google_api_key=GOOGLE_API_KEY
         )
         logger.info("✅ Gemini connection verified")
+        
+        logger.info(f"✅ Supported document formats: {', '.join(SUPPORTED_EXTENSIONS)}")
+        logger.info("✅ Ready to process documents at /hackrx/run")
         
     except Exception as e:
         logger.error(f"❌ Startup failed: {str(e)}")

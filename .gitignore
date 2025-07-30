@@ -39,5 +39,4 @@ dist/
 
 # Ignore custom folders
 llm_claims/
-data/
 documents/
