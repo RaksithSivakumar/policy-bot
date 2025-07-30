@@ -43,7 +43,13 @@ os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
 
 INDEX_NAME = "index-1"
 
-app = FastAPI(title="HackRX RAG API", description="Single endpoint RAG system for PDF, DOCX, and Email documents", version="1.0.0")
+# CHANGE 1: Add root_path for URL prefix support
+app = FastAPI(
+    title="HackRX RAG API", 
+    description="Single endpoint RAG system for PDF, DOCX, and Email documents", 
+    version="1.0.0",
+    root_path="/api/v1"  # This handles the /api/v1 prefix
+)
 
 # Security
 security = HTTPBearer()
@@ -445,7 +451,6 @@ def setup_qa_system(vectorstore):
             "Ensure your response style resembles professional policy documentation or FAQ tone with an accuracy range of 75–85%."
         )
 
-
         llm = ChatGoogleGenerativeAI(
             model="gemini-2.0-flash",
             google_api_key=GOOGLE_API_KEY,
@@ -579,6 +584,7 @@ async def run_queries(request: QueryRequest, token: str = Depends(verify_token))
         logger.error(f"❌ Error in run_queries: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# CHANGE 2: Update health endpoint to reflect new URL structure
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
@@ -586,18 +592,21 @@ async def health_check():
         "status": "healthy", 
         "message": "HackRX RAG API is running",
         "supported_formats": list(SUPPORTED_EXTENSIONS),
-        "endpoint": "/hackrx/run"
+        "endpoint": "/api/v1/hackrx/run",  # Updated to show full path
+        "public_url": "https://my-webhooks-endpoint.com/api/v1/hackrx/run"
     }
 
+# CHANGE 3: Update root endpoint to reflect new URL structure
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
         "message": "HackRX RAG API - Single Endpoint", 
         "version": "1.0.0",
-        "main_endpoint": "/hackrx/run",
+        "main_endpoint": "/api/v1/hackrx/run",  # Updated to show full path
         "supported_formats": list(SUPPORTED_EXTENSIONS),
-        "description": "Upload PDF, DOCX, or Email documents and ask questions about them"
+        "description": "Upload PDF, DOCX, or Email documents and ask questions about them",
+        "public_url": "https://my-webhooks-endpoint.com/api/v1/hackrx/run"
     }
 
 # Startup event
@@ -618,16 +627,20 @@ async def startup_event():
         logger.info("✅ Gemini connection verified")
         
         logger.info(f"✅ Supported document formats: {', '.join(SUPPORTED_EXTENSIONS)}")
-        logger.info("✅ Ready to process documents at /hackrx/run")
+        logger.info("✅ Ready to process documents at /api/v1/hackrx/run")
         
     except Exception as e:
         logger.error(f"❌ Startup failed: {str(e)}")
         raise
 
+# CHANGE 4: Update uvicorn configuration for deployment
 if __name__ == "__main__":
+    # Get port from environment variable (useful for deployment platforms)
+    port = int(os.getenv("PORT", 8000))
+    
     uvicorn.run(
         "main:app",  # Replace "main" with your filename if different
         host="0.0.0.0",
-        port=8000,
-        reload=True
+        port=port,
+        reload=False  # Set to False for production
     )
